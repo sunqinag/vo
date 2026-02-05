@@ -275,7 +275,7 @@ void DetectAndTrackImage(Mat& left_image, Mat& right_image, vector<Point2f>& lef
 
 
 
-// 定义重投影误差代价函数
+// 定义重投影误差代价函数（优化两个帧在world坐标系下的绝对姿态）
 struct ReprojectionError {
     ReprojectionError(const Eigen::Vector2d& observed_p1, const Eigen::Vector2d& observed_p2) 
         : observed_p1_(observed_p1), observed_p2_(observed_p2) {}
@@ -283,31 +283,37 @@ struct ReprojectionError {
     /**
      * @brief 重投影误差代价函数的计算运算符
      * 
-     * 这是ceres优化库要求的代价函数接口，用于计算特征点在第二个相机中的重投影误差。
-     * 该函数将被ceres自动调用，用于优化位姿和深度参数。
+     * 这是ceres优化库要求的代价函数接口，用于计算特征点在两个相机中的重投影误差。
+     * 该函数将被ceres自动调用，用于优化两个帧在world坐标系下的绝对姿态和深度参数。
      * 
      * @tparam T 模板参数，用于ceres的自动微分
-     * @param q 第二个相机相对于第一个相机的旋转四元数 [qw, qx, qy, qz]
-     * @param t 第二个相机相对于第一个相机的平移向量 [tx, ty, tz]
+     * @param q1 第一帧在world坐标系下的旋转四元数 [qw, qx, qy, qz]
+     * @param t1 第一帧在world坐标系下的平移向量 [tx, ty, tz]
+     * @param q2 第二帧在world坐标系下的旋转四元数 [qw, qx, qy, qz]
+     * @param t2 第二帧在world坐标系下的平移向量 [tx, ty, tz]
      * @param inv_depth 特征点的逆深度 (1/z)
      * @param residuals 输出的残差向量 [dx, dy]
      * @return bool 总是返回true，表示计算成功
      */
     template <typename T>
-    bool operator()(const T* const q, const T* const t, const T* const inv_depth, T* residuals) const {
-        // 根据逆深度计算特征点在第一个相机坐标系下的3D坐标
+    bool operator()(const T* const q1, const T* const t1, 
+                    const T* const q2, const T* const t2, 
+                    const T* const inv_depth, T* residuals) const {
+        // 根据逆深度计算特征点在第一帧相机坐标系下的3D坐标
         // 归一化平面坐标 (x, y) 乘以深度 (1/inv_depth) 得到3D坐标 (x/z, y/z, 1/z)
         Eigen::Matrix<T, 3, 1> pt_cam1(observed_p1_(0) / inv_depth[0], observed_p1_(1) / inv_depth[0], T(1.0) / inv_depth[0]);
         
-        // 将四元数转换为旋转矩阵，用于坐标变换
-        Eigen::Quaternion<T> Q(q[0], q[1], q[2], q[3]);
-        Eigen::Matrix<T, 3, 3> R = Q.toRotationMatrix();
+        // 将第一帧相机坐标系下的3D点转换到world坐标系
+        Eigen::Quaternion<T> Q1(q1[0], q1[1], q1[2], q1[3]);
+        Eigen::Matrix<T, 3, 3> R1 = Q1.toRotationMatrix();
+        Eigen::Matrix<T, 3, 1> pt_world = R1 * pt_cam1 + Eigen::Matrix<T, 3, 1>(t1[0], t1[1], t1[2]);
         
-        // 将特征点从第一个相机坐标系转换到第二个相机坐标系
-        // 转换公式: pt_cam2 = R * pt_cam1 + t
-        Eigen::Matrix<T, 3, 1> pt_cam2 = R * pt_cam1 + Eigen::Matrix<T, 3, 1>(t[0], t[1], t[2]);
+        // 将world坐标系下的3D点转换到第二帧相机坐标系
+        Eigen::Quaternion<T> Q2(q2[0], q2[1], q2[2], q2[3]);
+        Eigen::Matrix<T, 3, 3> R2_inv = Q2.conjugate().toRotationMatrix(); // 旋转矩阵的逆等于共轭四元数的旋转矩阵
+        Eigen::Matrix<T, 3, 1> pt_cam2 = R2_inv * (pt_world - Eigen::Matrix<T, 3, 1>(t2[0], t2[1], t2[2]));
         
-        // 将3D点投影到第二个相机的归一化平面
+        // 将3D点投影到第二帧相机的归一化平面
         // 投影公式: (x/z, y/z)
         Eigen::Matrix<T, 2, 1> predicted_p2(pt_cam2(0) / pt_cam2(2), pt_cam2(1) / pt_cam2(2));
         
@@ -320,7 +326,7 @@ struct ReprojectionError {
     }
 
     static ceres::CostFunction* Create(const Eigen::Vector2d& observed_p1, const Eigen::Vector2d& observed_p2) {
-        return (new ceres::AutoDiffCostFunction<ReprojectionError, 2, 4, 3, 1>(
+        return (new ceres::AutoDiffCostFunction<ReprojectionError, 2, 4, 3, 4, 3, 1>(
             new ReprojectionError(observed_p1, observed_p2)));
     }
 
@@ -334,21 +340,41 @@ void building_visual_constraints(vector<Point2f> &un_left_pts, vector<Point2f> &
 {
     // ===========================
 
-    double q[4]; // [qw, qx, qy, qz] - 第二个相机相对于第一个相机的旋转
-    q[0] = 1.0;
-    q[1] = 0.0;
-    q[2] = 0.0;
-    q[3] = 0.0;
-    double t[3]; // [tx, ty, tz] - 第二个相机相对于第一个相机的平移
-    t[0] = 0.0;
-    t[1] = 0.0;
-    t[2] = 0.0;
+    // 定义第一帧在world坐标系下的位姿 (q1, t1)
+    // q1: 四元数 [qw, qx, qy, qz]，初始化为单位四元数
+    // t1: 平移向量 [tx, ty, tz]，初始化为原点
+    double q1[4];
+    q1[0] = 1.0; q1[1] = 0.0; q1[2] = 0.0; q1[3] = 0.0;
+    double t1[3];
+    t1[0] = 0.0; t1[1] = 0.0; t1[2] = 0.0;
+    
+    // 定义第二帧在world坐标系下的位姿 (q2, t2)
+    // q2: 四元数 [qw, qx, qy, qz]，初始化为单位四元数
+    // t2: 平移向量 [tx, ty, tz]，初始化为原点
+    double q2[4];
+    q2[0] = 1.0; q2[1] = 0.0; q2[2] = 0.0; q2[3] = 0.0;
+    double t2[3];
+    t2[0] = 0.0; t2[1] = 0.0; t2[2] = 0.0;
 
     ceres::Problem problem;
 
     // 存储所有特征点的逆深度，确保它们在优化过程中一直存在
     std::vector<double> inv_depths;
     inv_depths.reserve(un_left_pts.size());
+    
+    // 先将参数块添加到问题中，然后再设置为常量
+    // 添加第一帧的姿态参数块到问题中
+    problem.AddParameterBlock(q1, 4); // 四元数，4个参数
+    problem.AddParameterBlock(t1, 3); // 平移向量，3个参数
+    
+    // 添加第二帧的姿态参数块到问题中
+    problem.AddParameterBlock(q2, 4); // 四元数，4个参数
+    problem.AddParameterBlock(t2, 3); // 平移向量，3个参数
+    
+    // 为了避免尺度歧义，固定第一帧在world坐标系下的姿态作为参考
+    // 这意味着第一帧的姿态将保持为初始值，只有第二帧的姿态和逆深度会被优化
+    problem.SetParameterBlockConstant(q1);
+    problem.SetParameterBlockConstant(t1);
     
     // 为每个特征点添加重投影误差约束
     for (size_t i = 0; i < un_left_pts.size(); ++i) {
@@ -365,10 +391,12 @@ void building_visual_constraints(vector<Point2f> &un_left_pts, vector<Point2f> &
         ceres::CostFunction* cost_function = ReprojectionError::Create(p1, p2);
         
         // 添加残差块到问题中，设置参数为待优化变量
-        // 逆深度通过指针传递，指向向量中的对应元素
-        problem.AddResidualBlock(cost_function, nullptr, q, t, &inv_depths.back());
-        
-        // 逆深度已作为优化参数，不固定
+        // 代价函数需要5个参数块：q1, t1, q2, t2, inv_depth
+        // 其中q1和t1是固定的，q2, t2和inv_depth是可优化的
+        problem.AddResidualBlock(cost_function, nullptr, 
+                                q1, t1,  // 第一帧姿态（固定）
+                                q2, t2,  // 第二帧姿态（待优化）
+                                &inv_depths.back()); // 逆深度（待优化）
     }
     
     // 配置求解器
@@ -382,16 +410,35 @@ void building_visual_constraints(vector<Point2f> &un_left_pts, vector<Point2f> &
     
     // 输出优化结果
     std::cout << summary.BriefReport() << std::endl;
-    std::cout << "优化后的位姿：" << std::endl;
-    std::cout << "四元数 [qw, qx, qy, qz]: " << q[0] << " " << q[1] << " " << q[2] << " " << q[3] << std::endl;
-    std::cout << "平移向量 [tx, ty, tz]: " << t[0] << " " << t[1] << " " << t[2] << std::endl;
     
-    // 将四元数转换为旋转矩阵
-    Eigen::Quaterniond Q(q[0], q[1], q[2], q[3]);
-    Eigen::Matrix3d R = Q.toRotationMatrix();
+    // 输出第一帧在world坐标系下的姿态（固定）
+    std::cout << "第一帧在world坐标系下的姿态（固定）：" << std::endl;
+    std::cout << "四元数 [qw, qx, qy, qz]: " << q1[0] << " " << q1[1] << " " << q1[2] << " " << q1[3] << std::endl;
+    std::cout << "平移向量 [tx, ty, tz]: " << t1[0] << " " << t1[1] << " " << t1[2] << std::endl;
     
-    std::cout << "旋转矩阵：" << std::endl;
-    std::cout << R << std::endl;
+    // 输出第二帧在world坐标系下的姿态（优化后）
+    std::cout << "第二帧在world坐标系下的姿态（优化后）：" << std::endl;
+    std::cout << "四元数 [qw, qx, qy, qz]: " << q2[0] << " " << q2[1] << " " << q2[2] << " " << q2[3] << std::endl;
+    std::cout << "平移向量 [tx, ty, tz]: " << t2[0] << " " << t2[1] << " " << t2[2] << std::endl;
+    
+    // 将第二帧的四元数转换为旋转矩阵
+    Eigen::Quaterniond Q2(q2[0], q2[1], q2[2], q2[3]);
+    Eigen::Matrix3d R2 = Q2.toRotationMatrix();
+    
+    std::cout << "第二帧旋转矩阵：" << std::endl;
+    std::cout << R2 << std::endl;
+    
+    // 计算第二帧相对于第一帧的相对姿态
+    Eigen::Quaterniond Q1(q1[0], q1[1], q1[2], q1[3]);
+    Eigen::Vector3d T1(t1[0], t1[1], t1[2]);
+    Eigen::Vector3d T2(t2[0], t2[1], t2[2]);
+    
+    Eigen::Quaterniond Q_relative = Q1.conjugate() * Q2;
+    Eigen::Vector3d T_relative = Q1.conjugate() * (T2 - T1);
+    
+    std::cout << "第二帧相对于第一帧的相对姿态：" << std::endl;
+    std::cout << "相对四元数 [qw, qx, qy, qz]: " << Q_relative.w() << " " << Q_relative.x() << " " << Q_relative.y() << " " << Q_relative.z() << std::endl;
+    std::cout << "相对平移向量 [tx, ty, tz]: " << T_relative.x() << " " << T_relative.y() << " " << T_relative.z() << std::endl;
     
     // 可视化优化后的特征点深度
     vector<float> optimized_depths;
