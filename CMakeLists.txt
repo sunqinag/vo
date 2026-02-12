@@ -10,6 +10,8 @@ find_package(yaml-cpp REQUIRED)
 find_package(Sophus REQUIRED)
 # 寻找Ceres包
 find_package(Ceres REQUIRED)
+# 寻找fmt包
+find_package(fmt REQUIRED)
 
 # 包含头文件目录
 include_directories(${OpenCV_INCLUDE_DIRS}
@@ -18,10 +20,16 @@ include_directories(${OpenCV_INCLUDE_DIRS}
     ${Sophus_INCLUDE_DIRS}
     ${CERES_INCLUDE_DIRS}
 )
-add_library(src src/camera_params.cpp)
-target_link_libraries(src ${YAML_CPP_LIBRARIES} ${Sophus_LIBRARIES} ${CERES_LIBRARIES} fmt)
+add_library(src src/camera_params.cpp
+                src/manager.cpp)
+target_link_libraries(src ${YAML_CPP_LIBRARIES} ${Sophus_LIBRARIES} ${CERES_LIBRARIES} fmt::fmt glog::glog)
 
 add_executable(test_triangulate test/test_triangulate.cpp )
 
+add_executable(test_vo test/test_vo.cpp )
+
+
 # 链接所有库到目标
-target_link_libraries(test_triangulate ${OpenCV_LIBS} ${YAML_CPP_LIBRARIES} ${Sophus_LIBRARIES} ${CERES_LIBRARIES} fmt src)
+target_link_libraries(test_triangulate ${OpenCV_LIBS} ${YAML_CPP_LIBRARIES} ${Sophus_LIBRARIES} ${CERES_LIBRARIES} fmt::fmt glog::glog src)
+
+target_link_libraries(test_vo ${OpenCV_LIBS} ${YAML_CPP_LIBRARIES} ${Sophus_LIBRARIES} ${CERES_LIBRARIES} fmt::fmt glog::glog src)
