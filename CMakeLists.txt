@@ -21,7 +21,8 @@ include_directories(${OpenCV_INCLUDE_DIRS}
     ${CERES_INCLUDE_DIRS}
 )
 add_library(src src/camera_params.cpp
-                src/manager.cpp)
+                src/manager.cpp
+                src/feature_manager.cpp)
 target_link_libraries(src ${YAML_CPP_LIBRARIES} ${Sophus_LIBRARIES} ${CERES_LIBRARIES} fmt::fmt glog::glog)
 
 add_executable(test_triangulate test/test_triangulate.cpp )

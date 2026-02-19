@@ -1,5 +1,8 @@
 #include "manager.h"
 #include <glog/logging.h>
+#include <opencv2/core/eigen.hpp>
+#include <Eigen/Dense>
+#include <sophus/se3.hpp>
 
 
 void reduceVector(std::vector<cv::Point2f>& v, std::vector<uchar> status)
@@ -64,6 +67,8 @@ Manager::Manager(std::string left_camera_path, std::string right_camera_path)
     // 初始化可视化相关属性
     prev_features_.clear();
     prev_feature_ids_.clear();
+    // 初始化特征点管理器
+    feature_manager_ = std::make_shared<FeatureManager>();
 }
 
 
@@ -79,7 +84,11 @@ void Manager::feedIMUData(IMUData &imu_data)
 
 void Manager::feedCameraData(CameraData &camera_data)
 {
+    LOG(INFO) << "feed image timestamp: " << camera_data.timestamp;
+    TicToc t_total; // 总耗时
+    
     cv::Mat left_gray, right_gray;
+    TicToc t_preprocess; // 预处理耗时
     if (camera_data.left_image.channels()==3)
     {
         // 将彩色图像转换为灰度图像，光流计算需要灰度图像
@@ -89,6 +98,7 @@ void Manager::feedCameraData(CameraData &camera_data)
         left_gray = camera_data.left_image;
         right_gray= camera_data.right_image;
     }
+    LOG(INFO) << "Image preprocessing cost time: " << t_preprocess.toc() << " ms";
 
     if (EQUALIZE)
     {
@@ -96,37 +106,58 @@ void Manager::feedCameraData(CameraData &camera_data)
         TicToc t_c;
         clahe->apply(left_gray, left_gray);
         clahe->apply(right_gray, right_gray);
-        LOG(INFO) << "CLAHE time: " << t_c.toc() << " ms";
+        LOG(INFO) << "CLAHE cost time: " << t_c.toc() << " ms";
     }
     
     // 保存当前图像
+    TicToc t_save;
     current_left_image_ = left_gray.clone();
     current_right_image_ = right_gray.clone();
+    LOG(INFO) << "Clone current images cost time: " << t_save.toc() << " ms";
     
     // 保存当前帧的特征点和ID作为上一帧，用于后续的可视化
     std::vector<cv::Point2f> temp_prev_features = curr_features_;
     std::vector<int> temp_prev_feature_ids = feature_ids_;
     
     // 特征点检测和追踪
+    TicToc t_feature;
     if (last_left_gray_.empty())
     {
         // 第一帧，检测新特征点
+        TicToc t_detect;
         cv::goodFeaturesToTrack(left_gray, curr_features_, max_corner_num_, 0.01, 30);
+        LOG(INFO) << "Feature detection cost time: " << t_detect.toc() << " ms";
+        
         // 为新特征点分配ID
+        TicToc t_id;
         feature_ids_.clear();
         for (size_t i = 0; i < curr_features_.size(); i++)
         {
             feature_ids_.push_back(feature_id_counter_++);
         }
+        LOG(INFO) << "Feature ID assignment cost time: " << t_id.toc() << " ms";
         
         // 第一帧，匹配左右帧特征点
+        TicToc t_match;
         std::vector<cv::Point2f> right_features;
         std::vector<uchar> status;
         std::vector<float> err;
         cv::calcOpticalFlowPyrLK(left_gray, right_gray, curr_features_, right_features, status, err);
+        LOG(INFO) << "Left-right matching cost time: " << t_match.toc() << " ms";
         
         // 过滤掉匹配失败的特征点
+        TicToc t_filter;
         reduceVector(curr_features_, right_features, feature_ids_, status);
+        LOG(INFO) << "Filter matched features cost time: " << t_filter.toc() << " ms";
+        
+        // 使用RANSAC剔除误匹配
+        if (curr_features_.size() >= 8) { // RANSAC需要至少8个点
+            TicToc t_ransac;
+            std::vector<uchar> inliers;
+            cv::findFundamentalMat(curr_features_, right_features, inliers, cv::FM_RANSAC, 1.0, 0.99);
+            reduceVector(curr_features_, right_features, feature_ids_, inliers);
+            LOG(INFO) << "RANSAC cost time: " << t_ransac.toc() << " ms";
+        }
         
         // 保存右帧特征点
         curr_right_features_ = right_features;
@@ -144,16 +175,40 @@ void Manager::feedCameraData(CameraData &camera_data)
         std::vector<float> err;
         
         // 追踪左帧特征点
+        TicToc t_track;
         cv::calcOpticalFlowPyrLK(last_left_gray_, left_gray, prev_features_, curr_features_, status, err);
+        LOG(INFO) << "Feature tracking cost time: " << t_track.toc() << " ms";
+        
+        // 保存有效的prev_features_点，确保与curr_features_大小匹配
+        std::vector<cv::Point2f> valid_prev_features;
+        for (size_t i = 0; i < prev_features_.size(); i++) {
+            if (status[i]) {
+                valid_prev_features.push_back(prev_features_[i]);
+            }
+        }
         
         // 过滤掉追踪失败的特征点
+        TicToc t_filter;
         reduceVector(curr_features_, status);
         reduceVector(curr_right_features_, status);
         reduceVector(feature_ids_, status);
+        LOG(INFO) << "Filter tracked features cost time: " << t_filter.toc() << " ms";
+        
+        // 使用RANSAC剔除前后帧之间的误匹配
+        if (curr_features_.size() >= 8) { // RANSAC需要至少8个点
+            TicToc t_ransac;
+            std::vector<uchar> inliers;
+            cv::findFundamentalMat(valid_prev_features, curr_features_, inliers, cv::FM_RANSAC, 1.0, 0.99);
+            reduceVector(curr_features_, inliers);
+            reduceVector(curr_right_features_, inliers);
+            reduceVector(feature_ids_, inliers);
+            LOG(INFO) << "RANSAC for tracking cost time: " << t_ransac.toc() << " ms";
+        }
         
         // 如果特征点数量不足，检测新特征点
         if (curr_features_.size() < max_corner_num_ * 0.5)
         {
+            TicToc t_new_features;
             std::vector<cv::Point2f> new_features;
             // 创建掩码，避免在已有特征点附近检测新特征点
             cv::Mat mask = cv::Mat::ones(left_gray.size(), CV_8UC1);
@@ -169,77 +224,88 @@ void Manager::feedCameraData(CameraData &camera_data)
                 curr_features_.push_back(pt);
                 feature_ids_.push_back(feature_id_counter_++);
             }
+            LOG(INFO) << "New feature detection cost time: " << t_new_features.toc() << " ms";
             
             // 为新检测的特征点匹配右帧特征点
-            if (!new_features.empty())
-            {
-                std::vector<cv::Point2f> new_right_features;
-                std::vector<uchar> new_status;
-                std::vector<float> new_err;
-                cv::calcOpticalFlowPyrLK(left_gray, right_gray, new_features, new_right_features, new_status, new_err);
-                
-                // 保存之前追踪的有效特征点
-                std::vector<cv::Point2f> valid_prev_features;
-                std::vector<cv::Point2f> valid_prev_right_features;
-                std::vector<int> valid_prev_ids;
-                
-                for (size_t i = 0; i < prev_features_.size(); i++)
+                if (!new_features.empty())
                 {
-                    if (status[i])
+                    TicToc t_new_match;
+                    std::vector<cv::Point2f> new_right_features;
+                    std::vector<uchar> new_status;
+                    std::vector<float> new_err;
+                    cv::calcOpticalFlowPyrLK(left_gray, right_gray, new_features, new_right_features, new_status, new_err);
+                    
+                    // 保存之前追踪的有效特征点
+                    std::vector<cv::Point2f> valid_prev_features;
+                    std::vector<cv::Point2f> valid_prev_right_features;
+                    std::vector<int> valid_prev_ids;
+                    
+                    for (size_t i = 0; i < prev_features_.size(); i++)
                     {
-                        valid_prev_features.push_back(curr_features_[i]);
-                        valid_prev_right_features.push_back(curr_right_features_[i]);
-                        valid_prev_ids.push_back(feature_ids_[i]);
-                    }
-                }
-                
-                // 过滤掉匹配失败的新特征点
-                std::vector<cv::Point2f> valid_new_features;
-                std::vector<cv::Point2f> valid_new_right_features;
-                std::vector<int> valid_new_ids;
-                
-                for (size_t i = 0; i < new_features.size(); i++)
-                {
-                    if (new_status[i])
-                    {
-                        valid_new_features.push_back(new_features[i]);
-                        valid_new_right_features.push_back(new_right_features[i]);
-                        // 找到对应的ID
-                        auto it = std::find(curr_features_.begin(), curr_features_.end(), new_features[i]);
-                        if (it != curr_features_.end())
+                        if (status[i])
                         {
-                            size_t idx = it - curr_features_.begin();
-                            valid_new_ids.push_back(feature_ids_[idx]);
+                            valid_prev_features.push_back(curr_features_[i]);
+                            valid_prev_right_features.push_back(curr_right_features_[i]);
+                            valid_prev_ids.push_back(feature_ids_[i]);
                         }
                     }
+                    
+                    // 过滤掉匹配失败的新特征点
+                    std::vector<cv::Point2f> valid_new_features;
+                    std::vector<cv::Point2f> valid_new_right_features;
+                    std::vector<int> valid_new_ids;
+                    
+                    for (size_t i = 0; i < new_features.size(); i++)
+                    {
+                        if (new_status[i])
+                        {
+                            valid_new_features.push_back(new_features[i]);
+                            valid_new_right_features.push_back(new_right_features[i]);
+                            // 找到对应的ID
+                            auto it = std::find(curr_features_.begin(), curr_features_.end(), new_features[i]);
+                            if (it != curr_features_.end())
+                            {
+                                size_t idx = it - curr_features_.begin();
+                                valid_new_ids.push_back(feature_ids_[idx]);
+                            }
+                        }
+                    }
+                    
+                    // 使用RANSAC剔除新特征点的误匹配
+                    if (valid_new_features.size() >= 8) { // RANSAC需要至少8个点
+                        std::vector<uchar> inliers;
+                        cv::findFundamentalMat(valid_new_features, valid_new_right_features, inliers, cv::FM_RANSAC, 1.0, 0.99);
+                        reduceVector(valid_new_features, valid_new_right_features, valid_new_ids, inliers);
+                    }
+                    
+                    // 移除未匹配的新特征点
+                    curr_features_.clear();
+                    curr_right_features_.clear();
+                    feature_ids_.clear();
+                    
+                    // 重新添加所有有效特征点
+                    // 先添加之前追踪的特征点
+                    for (size_t i = 0; i < valid_prev_features.size(); i++)
+                    {
+                        curr_features_.push_back(valid_prev_features[i]);
+                        curr_right_features_.push_back(valid_prev_right_features[i]);
+                        feature_ids_.push_back(valid_prev_ids[i]);
+                    }
+                    
+                    // 再添加新匹配的特征点
+                    for (size_t i = 0; i < valid_new_features.size(); i++)
+                    {
+                        curr_features_.push_back(valid_new_features[i]);
+                        curr_right_features_.push_back(valid_new_right_features[i]);
+                        feature_ids_.push_back(valid_new_ids[i]);
+                    }
+                    LOG(INFO) << "New feature matching cost time: " << t_new_match.toc() << " ms";
                 }
-                
-                // 移除未匹配的新特征点
-                curr_features_.clear();
-                curr_right_features_.clear();
-                feature_ids_.clear();
-                
-                // 重新添加所有有效特征点
-                // 先添加之前追踪的特征点
-                for (size_t i = 0; i < valid_prev_features.size(); i++)
-                {
-                    curr_features_.push_back(valid_prev_features[i]);
-                    curr_right_features_.push_back(valid_prev_right_features[i]);
-                    feature_ids_.push_back(valid_prev_ids[i]);
-                }
-                
-                // 再添加新匹配的特征点
-                for (size_t i = 0; i < valid_new_features.size(); i++)
-                {
-                    curr_features_.push_back(valid_new_features[i]);
-                    curr_right_features_.push_back(valid_new_right_features[i]);
-                    feature_ids_.push_back(valid_new_ids[i]);
-                }
-            }
         }
         else
         {
             // 对现有特征点进行左右帧匹配
+            TicToc t_lr_match;
             std::vector<cv::Point2f> right_features;
             std::vector<uchar> status;
             std::vector<float> err;
@@ -248,19 +314,119 @@ void Manager::feedCameraData(CameraData &camera_data)
             // 过滤掉匹配失败的特征点
             reduceVector(curr_features_, right_features, feature_ids_, status);
             
+            // 使用RANSAC剔除误匹配
+            if (curr_features_.size() >= 8) { // RANSAC需要至少8个点
+                std::vector<uchar> inliers;
+                cv::findFundamentalMat(curr_features_, right_features, inliers, cv::FM_RANSAC, 1.0, 0.99);
+                reduceVector(curr_features_, right_features, feature_ids_, inliers);
+            }
+            
             // 保存右帧特征点
             curr_right_features_ = right_features;
+            LOG(INFO) << "Left-right matching for existing features cost time: " << t_lr_match.toc() << " ms";
         }
     }
+    LOG(INFO) << "Feature processing cost time: " << t_feature.toc() << " ms";
     
     // 保存上一帧特征点和ID，用于可视化
     prev_features_ = temp_prev_features;
     prev_feature_ids_ = temp_prev_feature_ids;
     
     // 特征点追踪和匹配完成
+    LOG(INFO) << "Total feature tracking and matching cost time: " << t_feature.toc() << " ms";
+    // 去畸变当前帧特征点
+    undistortPoints(curr_features_, curr_undistorted_features_);
+    // 去畸变右帧特征点
+    undistortPoints(curr_right_features_, curr_right_undistorted_features_);
+
+    // 三角化当前帧特征点
+    std::vector<double> depths;
+    triangulate(curr_features_,curr_right_features_,depths);
+
+    // 更新特征管理器
+    feature_manager_->push_back(camera_data.timestamp,curr_undistorted_features_,curr_right_undistorted_features_,feature_ids_,depths);
     
     // 更新上一帧图像
+    TicToc t_update;
     last_left_gray_ = left_gray.clone();
+    LOG(INFO) << "Update last frame cost time: " << t_update.toc() << " ms";
+    
+    LOG(INFO) << "Total feedCameraData cost time: " << t_total.toc() << " ms";
+}
+
+void Manager::undistortPoints(std::vector<cv::Point2f> &points, std::vector<cv::Point2f> &undistorted_points)
+{
+    if (points.empty()) {
+        undistorted_points.clear();
+        return;
+    }
+    
+    // 获取相机内参和畸变系数
+    cv::Mat K = left_camera_params_->getK();
+    cv::Mat D = left_camera_params_->getD();
+    
+    // 使用 OpenCV 的 undistortPoints 函数进行去畸变并转换为归一化坐标
+    // 注意：undistortPoints 函数默认会返回归一化坐标（即除以焦距后的坐标）
+    cv::undistortPoints(points, undistorted_points, K, D);
+}
+
+/**
+ * @brief 对双目特征点进行三角化，计算深度值
+ * @param left_points 左相机像素坐标系下的特征点
+ * @param right_points 右相机像素坐标系下的特征点
+ * @param depths 输出的深度值向量
+ * @note 输入的特征点必须是像素坐标系下的原始坐标，因为投影矩阵已包含相机内参
+ */
+void Manager::triangulate(std::vector<cv::Point2f> &left_points,std::vector<cv::Point2f> &right_points,std::vector<double> &depths){
+    depths.clear();
+    if (left_points.empty() || right_points.empty() || left_points.size() != right_points.size()) {
+        return;
+    }
+    
+    // 获取左右相机的内参
+    cv::Mat K_left = left_camera_params_->getK();
+    cv::Mat K_right = right_camera_params_->getK();
+    
+    // 从相机参数中获取右相机相对于左相机的位姿
+    // 左相机相对于机体的位姿
+    Sophus::SE3d T_BS_left = left_camera_params_->getT_BS();
+    // 右相机相对于机体的位姿
+    Sophus::SE3d T_BS_right = right_camera_params_->getT_BS();
+    // 右相机相对于左相机的位姿
+    Sophus::SE3d T_Sleft_Sright = T_BS_left.inverse() * T_BS_right;
+    
+    // 提取旋转矩阵和平移向量
+    Eigen::Matrix3d R_eigen = T_Sleft_Sright.rotationMatrix();
+    Eigen::Vector3d t_eigen = T_Sleft_Sright.translation();
+    
+    // 转换为OpenCV格式
+    cv::Mat R, t;
+    cv::eigen2cv(R_eigen, R);
+    cv::eigen2cv(t_eigen, t);
+    
+    // 构造投影矩阵
+    cv::Mat P1 = K_left * cv::Mat::eye(3, 4, CV_64F); // 左相机投影矩阵
+    cv::Mat P2 = K_right * cv::Mat(cv::Mat::eye(3, 4, CV_64F)); // 右相机投影矩阵
+    P2.colRange(0, 3) = P2.colRange(0, 3) * R;
+    P2.col(3) = P2.colRange(0, 3) * t + P2.col(3);
+    
+    // 对每个特征点进行三角化
+    for (size_t i = 0; i < left_points.size(); i++) {
+        // 构造特征点矩阵
+        cv::Mat points4D;
+        std::vector<cv::Point2f> points1 = {left_points[i]};
+        std::vector<cv::Point2f> points2 = {right_points[i]};
+        
+        // 使用OpenCV的三角化函数
+        cv::triangulatePoints(P1, P2, points1, points2, points4D);
+        
+        // 转换为齐次坐标
+        cv::Mat point3D = points4D.col(0) / points4D.at<double>(3, 0);
+        
+        // 计算深度（z坐标）
+        double depth = point3D.at<double>(2, 0);
+        depths.push_back(depth);
+    }
 }
 
 cv::Mat Manager::visualizeFeatureTracking() const
